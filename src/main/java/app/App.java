@@ -1,5 +1,14 @@
 package app;
 
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWrite;
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWriteClient;
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWriteClientBuilder;
+import com.amazonaws.services.timestreamwrite.model.Dimension;
+import com.amazonaws.services.timestreamwrite.model.MeasureValueType;
+import com.amazonaws.services.timestreamwrite.model.Record;
+import com.amazonaws.services.timestreamwrite.model.WriteRecordsRequest;
+import com.amazonaws.services.timestreamwrite.model.WriteRecordsResult;
 import com.github.tornaia.geoip.GeoIP;
 import com.github.tornaia.geoip.GeoIPProvider;
 import io.jooby.AccessLogHandler;
@@ -7,11 +16,13 @@ import io.jooby.AttachedFile;
 import io.jooby.Context;
 import io.jooby.Jooby;
 import io.jooby.WebSocket;
+import io.jooby.aws.AwsModule;
 import io.jooby.json.JacksonModule;
 import is.tagomor.woothee.Classifier;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -26,8 +37,21 @@ public class App extends Jooby {
   private final Path file = Paths.get("conf/small.gif");
   private final ConcurrentHashMap<UUID, Set<WebSocket>> connectedUsers = new ConcurrentHashMap();
 
+  private final ClientConfiguration clientConfiguration = new ClientConfiguration()
+      .withMaxConnections(1000)
+      .withRequestTimeout(20 * 1000)
+      .withMaxErrorRetry(4);
+
   {
     install(new JacksonModule());
+    install(new AwsModule()
+        .setup(awsCredentialsProvider -> AmazonTimestreamWriteClientBuilder
+            .standard()
+            .withRegion("eu-west-1")
+            .withCredentials(awsCredentialsProvider)
+            .withClientConfiguration(clientConfiguration)
+            .enableEndpointDiscovery()
+            .build()));
     decorator(new AccessLogHandler());
 
     get("/{uuid}.gif", ctx -> {
@@ -46,17 +70,45 @@ public class App extends Jooby {
       String remoteAddress = ctx.getRemoteAddress();
       String country = geoIP
           .getTwoLetterCountryCode(remoteAddress)
-          .orElse("");
+          .orElse("Other");
 
       String referer = ctx
           .header("referer")
-          .value("");
+          .value("Other");
 
       Map<String, Object> event = Map
           .of("country", country
               , "referer", referer
               , "userAgent", userAgent
               , "id", id);
+
+      final Dimension countryDim = new Dimension()
+          .withName("country")
+          .withValue(country);
+      final Dimension refererDim = new Dimension()
+          .withName("referer")
+          .withValue(referer);
+      final Dimension userAgentDim = new Dimension()
+          .withName("userAgentName")
+          .withValue(userAgent.getOrDefault("name", "Other"));
+      final Dimension uuidDim = new Dimension()
+          .withName("id")
+          .withValue(id);
+
+      Record pageView = new Record()
+          .withMeasureName("page_view")
+          .withDimensions(List.of(countryDim, refererDim, userAgentDim, uuidDim))
+          .withTime(String.valueOf(System.currentTimeMillis()))
+          .withMeasureValue(String.valueOf(true))
+          .withMeasureValueType(MeasureValueType.BOOLEAN);
+
+      WriteRecordsRequest writeRecordsRequest = new WriteRecordsRequest()
+          .withDatabaseName("lynx_database_test")
+          .withTableName("lynx_table_test")
+          .withRecords(List.of(pageView));
+
+      WriteRecordsResult writeRecordsResult = require(AmazonTimestreamWrite.class)
+          .writeRecords(writeRecordsRequest);
 
       Optional
           .ofNullable(connectedUsers.get(uuid))
@@ -95,7 +147,7 @@ public class App extends Jooby {
       });
 
       configurer.onError((ws, cause) -> {
-          log.error("onError {}: {}", ws, cause);
+        log.error("onError {}: {}", ws, cause);
       });
     });
   }
